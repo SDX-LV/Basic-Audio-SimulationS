@@ -45,7 +45,8 @@ import subprocess
 #       v1.10    2024-01-13     Changed into function/script format based on "plot_sofa_hrtf.py" v1.03 (by S. D.)
 #    https://sourceforge.net/p/mesh2hrtf-tools/code/ci/master/tree/convert_n_analyse_HRTF/plot_sofa_hrtf.py
 #       v1.11    2024-01-20     Lots of small fixes - CPU & RAM usage limiter needs redesign! (by S. D.)
-version = 'v1.11'  # <<<  for printouts.
+#       v1.20    2024-01-21     added "kill_processes_on_overload" function + optimizations (by S. D.)
+version = 'v1.20'  # <<<  for printouts.
 
 
 #
@@ -55,14 +56,6 @@ version = 'v1.11'  # <<<  for printouts.
 #   in case there is more than enough RAM. (all of this resource monitoring works reasonably well). To have full
 #   control over RAM usage ElmerScanManager runs ElmerSolver instances with a single frequency step at a time.
 #
-
-# ToDo: future improvement ideas
-#   - add start_path input to the script (so-far start_path can only be changed by editing the script itself)
-#   - add nice printout for total processing time.
-#   - Long-Term - try to run some low frequency instances in parallel with high-frequency instances to better utilize
-#       RAM in the beginning of the simulation project (this could be tricky and require new RAM monitoring code).
-#
-
 # to see all options run   "python elmer_scan_manager.py --help"
 def create_cli():
     # 1 parse command line input ----------------------------------------------------
@@ -100,6 +93,10 @@ def create_cli():
               "instances. Consider to lower limit to keep computer responsive for mutitasking!"
               " Note: the actual CPU usage can be higher - not a precise algorithm!."))
     parser.add_argument(
+        "--kill_processes_on_overload", default='True', choices=('True', 'False'), type=str,
+        help=("Kill some running Elmer solver processes in case CPU usage consistently over max_cpu_load_percent OR "
+              "RAM memory consistently has less than 500 BM free. "))
+    parser.add_argument(
         "--cleanup_after_finish", default='True', choices=('True', 'False'), type=str,
         help="Delete not-useful files generated during simulation after completion.")
 
@@ -111,7 +108,7 @@ def create_cli():
 
 
 def main(start_path='False', auto_set_max_instances=True, max_instances=8, root_elmer='', sec_to_initialize=7,
-         ram_safety_factor=0.95, max_cpu_load_percent=80, cleanup_after_finish=True):
+         ram_safety_factor=0.95, max_cpu_load_percent=80, kill_processes_on_overload=True, cleanup_after_finish=True):
     # 2 initialization --------------------------------------------------------------
 
     # hard-coded filenames:
@@ -129,6 +126,7 @@ def main(start_path='False', auto_set_max_instances=True, max_instances=8, root_
         elmersolver_executable = "ElmerSolver.exe"
     else:  # elif os.name == 'posix': # Linux or Mac detected
         elmersolver_executable = "ElmerSolver"
+    temp_max_instances = 999999  # reset temporary limit
 
     os.system("")  # trick to get colored print-outs   https://stackoverflow.com/a/54955094
     text_color_red = '\033[31m'
@@ -152,6 +150,9 @@ def main(start_path='False', auto_set_max_instances=True, max_instances=8, root_
     if start_path == 'False':
         print('   (searching for simulation projects next to "' + os.path.basename(__file__) + '")')
         start_path = working_dir
+
+    if auto_set_max_instances:
+        max_instances = 0  # this allows to set instances several times
 
     # Detect what the start_path is pointing to:
     if os.path.isfile(os.path.join(start_path, main_solver_input)):  # - is it Project folder?
@@ -251,19 +252,26 @@ def main(start_path='False', auto_set_max_instances=True, max_instances=8, root_
                       newline="\n") as text_file:
                 text_file.write(generated_sif + "\n1\n")  # first & second lines
 
-        # 4 main loop for each step/instance  --------------------------------------------------------------        
-        for sim_step in range(0, total_nr_to_run):
+        # 4 main loop for each step/instance  --------------------------------------------------------------
+        sim_step = -1  # re-init
+        running_processes = []  # re-init
+        process_was_killed = False  # re-set flag
+        while sim_step < total_nr_to_run-1:    # loop until all steps are executed (with option to repeat)
+            sim_step += 1  # increment by one
             step = steps_to_run[sim_step]
-            print("- ", str(sim_step + 1), "/", str(total_nr_to_run), " preparing >>>",
-                  str(freq_of_steps_to_run[sim_step]),
-                  "Hz <<< instance at step", str(step))
+            too_much_cpu_load_strike = 0    # re-init for kill_processes_on_overload
+            too_much_ram_load_strike = 0    # re-init for kill_processes_on_overload
+            # print("- ", str(sim_step + 1), "/", str(total_nr_to_run), " preparing >>>",
+            #       str(freq_of_steps_to_run[sim_step]),
+            #       "Hz <<< instance at step", str(step))
 
             # double check (roughly) that this instance does not have output
             path_to_check = os.path.join(projects_to_run[proj], freq_file + str(step) + freq_file_ext)
             if os.path.isfile(path_to_check):
-                print(text_color_cyan, "step with output file ", freq_file + str(step) + freq_file_ext,
-                      "--- already has output data! Skipping")
+                print(text_color_cyan, "Skipping step with output file", freq_file + str(step) + freq_file_ext,
+                      "--- because already has output data!")
                 print(text_color_reset + " ")
+                running_processes.append(0)  # append dummy zero
                 continue  # jump over this instance
 
             # Check the RAM & run instance if feasible
@@ -272,7 +280,7 @@ def main(start_path='False', auto_set_max_instances=True, max_instances=8, root_
                   str(ram_info.percent), "%     [", time.strftime("%d %b - %H:%M:%S", time.localtime()), "]")
 
             # Run this once - normally before launching the 2nd instance IF "auto_set_max_instances == True"
-            if sim_step > 0 and auto_set_max_instances:  # use this to autodetect how many instances should be executed.
+            if sim_step > 0 and max_instances == 0:  # use this to autodetect how many instances should be executed.
                 # noinspection PyBroadException
                 try:
                     # it is better to get fresh pid (hopefully at least one ElmerSolver process is still running)
@@ -287,7 +295,6 @@ def main(start_path='False', auto_set_max_instances=True, max_instances=8, root_
                     print("One instance loads CPU to", str(round(instance_cpu_usage_now, 1)),
                           "% on this machine, therefore",
                           "max_instances is now automatically set =", str(max_instances))
-                    auto_set_max_instances = False  # mark that max instances does not need to be checked again.
                 except BaseException:
                     print(
                         "!!! Failed to auto_set_max_instances - this can happen if ElmerSolver process finished ",
@@ -310,54 +317,96 @@ def main(start_path='False', auto_set_max_instances=True, max_instances=8, root_
                 if len(pid_name_bytes) == 0:  # if no ElmerSolver processes are running, so Go start one instance.
                     break
 
-                elif len(pid_name_bytes) < max_instances:  # if the max number of instances to launch is not exceeded
+                # find out how much RAM consumes the biggest ElmerSolver Instance
+                max_elmersolver_ram = pid_name_bytes[0][2]  # init
+                if len(pid_name_bytes) > 1:  # if more than one process
+                    for prcNr in range(1, len(pid_name_bytes)):
+                        if pid_name_bytes[prcNr][2] > max_elmersolver_ram:
+                            # finding ElmerSolver process that consumes the most RAM
+                            max_elmersolver_ram = pid_name_bytes[prcNr][2]
 
-                    # find out how much RAM consumes the biggest ElmerSolver Instance
-                    max_elmersolver_ram = pid_name_bytes[0][2]  # init
-                    if len(pid_name_bytes) > 1:  # if more than one process
-                        for prcNr in range(1, len(pid_name_bytes)):
-                            if pid_name_bytes[prcNr][2] > max_elmersolver_ram:
-                                # finding ElmerSolver process that consumes the most RAM
-                                max_elmersolver_ram = pid_name_bytes[prcNr][2]
+                # check if we can run more:  Is free RAM is greater than
+                #                       RAM consumption of the biggest ElmerSolver instance * ram_safety_factor .
+                ram_info = psutil.virtual_memory()
+                # CPU load - still not the same CPU load estimate compared to Windows TaskManager!
+                total_cpu_load = psutil.cpu_percent(interval=0.5, percpu=False)  # takes 0.5 seconds!!!
+                if ((ram_info.available > max_elmersolver_ram * ram_safety_factor) &
+                        (total_cpu_load < max_cpu_load_percent)):
 
-                    # check if we can run more:  Is free RAM is greater than
-                    #                       RAM consumption of the biggest ElmerSolver instance * ram_safety_factor .
-                    ram_info = psutil.virtual_memory()
-                    # CPU load - still not the same CPU load estimate compared to Windows TaskManager!
-                    total_cpu_load = psutil.cpu_percent(interval=0.5, percpu=False)  # takes 0.5 seconds!!!
-                    if ((ram_info.available > max_elmersolver_ram * ram_safety_factor) &
-                            (total_cpu_load < max_cpu_load_percent)):
+                    if len(pid_name_bytes) < min(max_instances, temp_max_instances):
+                        # if the max number of instances to launch is not exceeded:
+
                         print("   enough RAM to run one more:     ", str(round((ram_info.available / 1073741824), 1)),
                               "GB free", "     [", time.strftime("%d %b - %H:%M:%S", time.localtime()), "]")
-                        break
+
+                        break  # out of wait for resources loop
 
                     else:
-                        if total_cpu_load > max_cpu_load_percent:  # CPU limitation
-                            print("   Waiting for less load on CPU:     ", str(total_cpu_load),
-                                  "% CPU load    (", str(max_cpu_load_percent), "% allowed)     [",
-                                  time.strftime("%d %b - %H:%M:%S", time.localtime()), "]")
-                        else:   # RAM limitation
-                            print("   Waiting for more free RAM:     ",
-                                  str(round((ram_info.available / 1073741824), 1)), "GB free    (",
-                                  str(round((max_elmersolver_ram * ram_safety_factor / 1073741824), 1)), "GB needed)",
-                                  "     [", time.strftime("%d %b - %H:%M:%S", time.localtime()), "]")
-
-                        if len(pid_name_bytes) == 1:  # only one process
-                            # extra delay before trying the while loop again for very large processes
-                            time.sleep(4 * sec_to_initialize)
+                        print("   No more instances allowed - waiting for 1 out of", str(
+                            min(max_instances, temp_max_instances)), "instances to finish")
+                        too_much_cpu_load_strike = 0  # reset strikes
+                        too_much_ram_load_strike = 0  # reset strikes
 
                 else:
-                    print("   No more instances allowed - waiting for 1 out of", str(max_instances),
-                          "instances to finish")
+                    if ram_info.available / 1073741824 < 0.5:   # less than 500 MB of free RAM
+                        too_much_ram_load_strike += 1   # count strikes
+                    else:
+                        too_much_ram_load_strike = 0  # reset strikes
+
+                    if total_cpu_load > max_cpu_load_percent:  # CPU limitation
+                        too_much_cpu_load_strike += 1   # count strikes
+                        print("   Waiting for less load on CPU:     ", str(total_cpu_load), "% CPU load   ("
+                              + str(max_cpu_load_percent), "% allowed | strike", str(too_much_cpu_load_strike) +
+                              ")  [", time.strftime("%d %b - %H:%M:%S", time.localtime()), "]")
+
+                    else:   # RAM limitation
+                        print("   Waiting for more free RAM:     ",
+                              str(round((ram_info.available / 1073741824), 1)), "GB free    (" +
+                              str(round((max_elmersolver_ram * ram_safety_factor / 1073741824), 1)),
+                              "GB needed | strike", str(too_much_ram_load_strike) + ")   [",
+                              time.strftime("%d %b - %H:%M:%S", time.localtime()), "]")
+                        too_much_cpu_load_strike = 0  # reset strikes
+
+                    if len(pid_name_bytes) == 1:  # if only one process
+                        # extra delay before trying the while loop again for very large processes
+                        time.sleep(4 * sec_to_initialize)
+                    elif (kill_processes_on_overload == 'True' and
+                          (too_much_cpu_load_strike > 4 or too_much_ram_load_strike > 4)):
+                        # if time to kill processes due to prolonged resource overload
+                        if running_processes[sim_step-1] != 0:  # only possible if there are no dummy zero processes
+                            print("XXX - Killing", str(sim_step + 0) + "/" + str(total_nr_to_run),
+                                  "to free-up resources for other processes (will re-try when possible)")
+
+                            # kill last started Elmer process
+                            running_processes[sim_step-1].kill()
+                            del running_processes[sim_step-1]  # remove handle of the killed process
+
+                            # temporarily limit number of processes
+                            pid_name_bytes = [(p.pid, p.info['name'], p.info['memory_info'].rss) for p in
+                                              psutil.process_iter(['name', 'memory_info']) if
+                                              p.info['name'] == elmersolver_executable]
+                            temp_max_instances = len(pid_name_bytes)  # set temporary limit
+
+                            # mark that max instances should be checked again.
+                            max_instances = 0
+                            process_was_killed = True  # set flag
+                            break
 
                 # delay before trying the while loop again
                 time.sleep(sec_to_initialize)
 
             # END of wait_for_resources while loop
 
+            if process_was_killed:
+                sim_step -= 2  # roll-back step counter to retry the killed instance
+                process_was_killed = False  # re-set flag
+                continue  # skip to beginning of the main loop
+
+            temp_max_instances = 999999  # reset temporary limit
+
             # START one more instance
-            print("- ", str(sim_step + 1), "/", str(total_nr_to_run), " STARTING instance from:",
-                  projects_to_run[proj], ">>>    step", str(step))
+            print("-", str(sim_step + 1) + "/" + str(total_nr_to_run), "Starting >>> "
+                  + str(freq_of_steps_to_run[sim_step]) + " Hz <<<  step", str(step), " from:", projects_to_run[proj])
 
             # (over) Write the simulation .sif parameters for this instance:
             two_lines = "$npart = " + str(step) + "\n$f = " + str(freq_of_steps_to_run[sim_step]) + " 		! Hz \n\n"
@@ -367,11 +416,15 @@ def main(start_path='False', auto_set_max_instances=True, max_instances=8, root_
             if os.name == 'nt':  # Windows detected
                 log_file_handle = open(post_file + str(step) + "_log.txt", "w")  # create a log file for all print-outs
                 # run ElmerSolver & route all printouts to a log file
-                subprocess.Popen(os.path.join(root_elmer, elmersolver_executable), stdout=log_file_handle)
+                process = subprocess.Popen(
+                    os.path.join(root_elmer, elmersolver_executable), stdout=log_file_handle)
 
             else:  # elif os.name == 'posix': # Linux or Mac detected
                 # run ElmerSolver & route all printouts to a log file
-                subprocess.Popen(elmersolver_executable + " >" + post_file + str(step) + "_log.txt", shell=True)
+                process = subprocess.Popen(
+                    elmersolver_executable + " >" + post_file + str(step) + "_log.txt", shell=True)
+
+            running_processes.append(process)  # store handle to the process
 
             # optimize waiting time (important if available RAM >>> than needed RAM)
             if sim_step > 0:  # on the not-first loop
